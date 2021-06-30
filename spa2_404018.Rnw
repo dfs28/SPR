@@ -1,0 +1,519 @@
+\documentclass{article}
+\usepackage{natbib}
+\usepackage{graphicx}
+\usepackage{graphicx, subfig}
+\usepackage[a4paper, total={6in, 8in}, margin = 1in]{geometry}
+\usepackage{hyperref}
+
+\title{SPA2}
+\author{404018}
+\date{November 2020}
+
+\begin{document}
+
+<<echo = FALSE, eval=TRUE, include=FALSE>>=
+#Set up options
+library(ggplot2)
+library(parallel)
+library(Rcpp)
+library(tidyverse)
+@
+
+
+
+\maketitle
+
+\section{Question 1 - Simulating logistical equation}
+\subsection{Introduction}
+The logistical equation (a non-linear difference equation)
+
+\begin{equation}
+x_{t+1} = \alpha x_t(1-x_t)
+\end{equation}
+is can be used to simulate a population that exponentially at small values but has some sort of constraint on its maximum $(1-x_t)$. At small values it converges to 0 however from 1 to 3 it tends to converge to a single point. At values above 3 however it exhibits periodicity, and above 3.5701 (see \href{http://homepages.warwick.ac.uk/~masdh/ODE2003/DiffEqA2.pdf}{here}) doubling occurs every $n$ iterations of the equation. 
+
+\subsection{Methods}
+\subsubsection{Function 1}
+To investigate the stationary points I wrote a loop function in Rcpp (\href{https://cran.r-project.org/web/packages/Rcpp/index.html}{citation}) to iterate over the logistical equation to deep enough that the stationary points will stabilise. I used Rcpp to allow deep computation in the time frame.
+
+<<Block1>>=
+#Rcpp function to iterate over the logistic equation
+cppFunction(
+'long double logistic_singleC(long double R, double x0, int n) {
+long double x = x0;
+  for (int i = 0; i < n; i++) {
+  x = R*x*(1-x);
+  }
+  return x;
+  }')
+@
+
+\subsubsection{Function 2}
+Following this I built a table of length $2^{14}$ containing sequential iterations of the logistical equation for every value between 2.8 and 3.6.
+
+<<Block2>>=
+logistic.table <- function(r, x0, n) {
+  
+  #Function that outputs logistic function results sequentially in vector
+  result <- c(rep(NULL, n))
+  result[1] <- x0
+  
+  #Round N up so can only be an integer
+  n <- as.integer(ceiling(n))
+  
+  #Only run if n > 1
+  if (n <= 1 ) {stop('n must be greater than 1')}
+  
+  #Run the logistic equation with output into a df
+  for (i in 2:n) {
+    result[i] <- r*result[i-1]*(1-result[i-1])
+  }
+  return(result)
+}
+@
+
+<<Block3, echo = FALSE>>=
+r.vec <- c(seq(2.8, 3.6, by = 0.001))
+x.e5 <- sapply(r.vec, logistic_singleC, x0=0.5, n = 1e5)
+logit.product.tb <- mapply(logistic.table, r = r.vec, x0 = x.e5, n = 2^14)
+
+#Find when they split using unique() then consider if still getting closer together or not
+#Start sequentially 1 -> 2 -> 4 etc
+
+stat.points <- 1
+stat.points.df <- data.frame(r = NA, stat.point = NA, total.stats = NA)
+@
+
+\subsubsection{Search Strategy}
+Using the prior knowledge that the number of stationary points sequentially doubles I used a loop to work iteratively on increasing values. I found the unique values in each column of the table generated. If these were separated by only a floating point error I counted them as the same. If there were more unique values than the number of expected stationary points at this stage I tested for convergence of points. 
+
+To ensure that they weren't found to converge by chance I took the larger value of the difference between the 1st and $1 + n$, and 1st and $1 + 2n$ value. I did the same at the end ensuring that the values were in phase. If the difference increased from beginning to the end I doubled the number of expected stationary points and took this number, finding the average value of the first and second instance of each stationary point to use for the plot. 
+
+<<Block4>>=
+#Sequentially work through all R values
+for (i in 1:length(r.vec)) {
+  
+  unique.vals <- unique(logit.product.tb[,i])
+  
+  #Work out if more than expected unique value found, if so ?converging 
+  if (length(unique(logit.product.tb[,i])) >= stat.points*2) {
+    
+    #Find differences between 1, 1+stat point, 1+stat.point*2, choose biggest
+    start.diff1 <- logit.product.tb[1,i] - logit.product.tb[(stat.points + 1), i]
+    
+    #If difference between first and next stat.point not negligable 
+    #find 1+stat.point*2, choose biggest
+    if (abs(start.diff1) > 4.440892e-15 ) {
+      
+      start.diff2 <- logit.product.tb[1,i] - logit.product.tb[(stat.points*2 + 1), i]
+      ifelse(abs(start.diff2) > abs(start.diff1), 
+             start.diff <- start.diff2, start.diff <- start.diff1)
+      
+      #Find differences at the end, using the same periodicity 
+      #(problems with being out of sync)
+      tab.length <- dim(logit.product.tb)[1]
+      from.end <- (tab.length - (tab.length %% stat.points)) - stat.points + 1
+      end.diff1 <- logit.product.tb[from.end,i] - 
+                    logit.product.tb[from.end-stat.points, i]
+      end.diff2 <- logit.product.tb[from.end,i] - 
+                    logit.product.tb[from.end-stat.points*2, i]
+      ifelse(abs(end.diff2) > abs(end.diff1), 
+             end.diff <- end.diff2, end.diff <- end.diff1)
+      
+      
+      #If difference between 2 not converging there is now a new stat point
+      
+      if (stat.points < dim(logit.product.tb)[1]/4 && 
+          abs(start.diff) - abs(end.diff) <= 4.440892e-15) {
+        stat.points <- stat.points*2
+      }
+    }
+  }
+  
+  #split table into number of stat points
+  stat.split <- seq(1, dim(logit.product.tb)[1], by = stat.points)
+  split.matrix <- matrix(nrow = length(stat.split), ncol = stat.points)
+  
+  for (j in 1:stat.points) {
+    stat.split <- seq(j, dim(logit.product.tb)[1], by = stat.points)
+    split.matrix[,j] <- logit.product.tb[stat.split,i]
+    
+    #Take average of last 2 points in each converging series
+    stat.coord <- (split.matrix[length(stat.split), j] + 
+                     split.matrix[(length(stat.split)-1), j])/2
+    stat.coord <- data.frame(r = r.vec[i], stat.point = stat.coord, 
+                             total.stats = stat.points)
+    stat.points.df <- rbind(stat.points.df, stat.coord)
+  }
+}
+@
+\subsection{Results}
+
+<<Block5, echo=FALSE, warning=FALSE, fig.width= 10, fig.height=7>>=
+ggplot(stat.points.df) + geom_point(aes(x = r, y = stat.point), size = 0.1) + theme_bw() +
+  ggtitle('Plot of stable points from 2.8 to 3.6') +
+  xlab('alpha') + ylab('Value for stable point')
+@
+
+
+\subsection{Accurate estimate of points of divergence}
+I used the above method of testing convergence and uniqueness of points to calculate accurate estimates for the points where convergence happened. I converted the above loop to a function and used a decimal search strategy to generate estimates to 10 significant figures. I used this to generate the below table of bifurcation points.
+
+<<Block6, echo = FALSE>>=
+#Function for finding points of divergence
+find.stat.point <- function(input.vector) {
+
+  unique.vals <- unique(input.vector)
+  stat.points <- 1
+  
+  repeat {
+    
+    if (length(unique(input.vector)) >= stat.points*2) {
+    
+    #Find differences between 1, 1+stat point, 1+stat.point*2, choose biggest
+    start.diff1 <- input.vector[1] - input.vector[(stat.points + 1)]
+    
+    #If difference between first and next stat.point not negligable 
+    #find 1+stat.point*2, choose biggest
+    if (abs(start.diff1) > 4.440892e-15 ) {
+      
+      start.diff2 <- input.vector[1] - input.vector[(stat.points*2 + 1)]
+      ifelse(abs(start.diff2) > abs(start.diff1), 
+             start.diff <- start.diff2, start.diff <- start.diff1)
+      
+      #Find differences at the end, using the same periodicity (problems with being out of sync)
+      tab.length <- length(input.vector)
+      from.end <- (tab.length - (tab.length %% stat.points)) - stat.points + 1
+      end.diff1 <- input.vector[from.end] - input.vector[from.end-stat.points]
+      end.diff2 <- input.vector[from.end] - input.vector[from.end-stat.points*2]
+      ifelse(abs(end.diff2) > abs(end.diff1), 
+             end.diff <- end.diff2, end.diff <- end.diff1)
+      
+      
+      #If difference between 2 not converging there is now a new stat point
+      
+      if (stat.points < length(input.vector)/4 && 
+          (abs(start.diff) - abs(end.diff)) <= 4.440892e-15) {
+        stat.points <- stat.points*2
+      } else {break}
+    } else {break}
+    } else {break}
+  }
+  return(stat.points)
+  
+}
+
+#Use decimal search to find points of divergence
+bifurc.points <- c(1,2,4,8,16,32)
+bifurc.loc <- c()
+for (i in bifurc.points) {
+  last.elem <- which(stat.points.df$total.stats == i)
+  bifurc.loc <- c(bifurc.loc, last.elem[length(last.elem)])
+}
+
+
+bifurc.points.df <- data.frame(R = c(), bifurc.point = c())
+for (i in 1:length(bifurc.points)) {
+  
+  #Set search range
+  sig.fig <- 3
+  search.centre <- stat.points.df$r[bifurc.loc[i]]
+  search.range <- seq(from = (search.centre - (10^-sig.fig)), 
+                      to = (search.centre + (10^-sig.fig)), by = 10^-(sig.fig + 1))
+  
+  #Continually search deeper until bifurcation point found to set number of sig figs
+  while (sig.fig <= 10) {
+    
+    #Search along range
+    for (j in search.range) {
+      logit.start <- logistic_singleC(j, x0=0.5, n = 1e7)
+      logit.vector <- logistic.table(j, x0 = logit.start, n = 2^14)
+      stationary.point <- find.stat.point(logit.vector)
+      if (stationary.point > bifurc.points[i]) {break}
+    }
+    
+    #Re set search range around new point
+    search.range <- seq(from = (j - 10^-(sig.fig)), 
+                        to = (j + 10^-(sig.fig)), by = 10^-(sig.fig + 1))
+    sig.fig <- sig.fig + 1
+  }
+  stat.point.df <- data.frame(R = j, bifurc.point = stationary.point)
+  bifurc.points.df <- rbind(bifurc.points.df, stat.point.df)
+}
+
+options(digits = 11)
+bifurc.points.df
+options(digits = 7)
+@
+
+
+\newpage
+\section{Question 2 - Simulating ping pong game}
+
+\subsection{Rules}
+\begin{enumerate}
+    \item Player 1 serves first. Each player serves for S = 2 points before switching to the other player.
+    \item The game is won when one player has won P points, where $P \geq T$ ($T = 11$) points AND the other player has at most $P - 2$ points. So a player can win 11-8, 11-9, 12-10 (but not 11-10 or 12-11).
+    \item When player $i$ serves the ball, they have a probability $A_i$ of winning the point by serving an Ace. Otherwise, each player has a probability $P_i$ of winning the point when they hit the ball back to the other player. The rally length for a point is the number of times the ball was hit before the point was won.
+\end{enumerate}
+
+\subsection{Solution}
+\subsubsection{Function to calculate winner of each point}
+I built a function to simulate each point, which returns the winner and rally length. I used the function runif and then used this with the probabilities given to return whether or not the point had been won.
+
+<<Block7>>=
+#Question 2 - Ping pong - as below code necessary to run simulation functions
+point.calc <- function(S, R, server, returner) {
+  
+  # Function to calculate who wins and rally length
+  if (S >= runif(n = 1)) {
+    return(data.frame(win = server, rally.len = 1))
+  } else {
+    i <- 1; p <- 0
+    while (p <= 0.5) {
+      i <- i + 1
+      p <- runif(n = 1)
+    }
+    if (i %% 2 == 1) {
+      return(data.frame(win = server, rally.len = i))
+    } else {return(data.frame(win = returner, rally.len = i))}
+  }
+}
+@
+
+\subsubsection{Function to calculate winner of each game}
+I then wrote a function to simulate each game to calculate a winner using the ping pong rules given. Points were played, with each player serving twice and the first player to have both 11 points and $\geq 2$ more points than the other was the winner.
+
+
+<<Block8>>=
+ping.pong <- function(S1 = 0.6, S2 = 0.6, R = 0.5, n = 11, serve.n = 2) {
+  #Function to simulate ping pong game
+  
+  #Set up some initial parameters
+  points.s1 <- 0
+  points.s2 <- 0
+  score.sheet <- data.frame(win = NA, rally.len = NA)
+  count <- 1
+  who.serves <- c()
+  for (i in 1:serve.n) {
+    who.serves <- c(who.serves, seq(1, 1e6, by = serve.n*2) + (i -1))
+  }
+  
+  #While no-one has won keep playing
+  while(((points.s1 >= n | points.s2 >= n) & (abs(points.s1 - points.s2) >= 2)) == FALSE) {
+    
+    #Alternate who serves
+    if (count %in% who.serves == TRUE) {
+      this.point <- point.calc(S1, R, 'first', 'second')
+    } else {
+      this.point <- point.calc(S2, R, 'second', 'first')
+    }
+    count <- count + 1
+    
+    #Tally up the scores each time
+    score.sheet <- rbind(score.sheet, this.point)
+    points.s1 <- length(which(score.sheet$win == 'first'))
+    points.s2 <- length(which(score.sheet$win == 'second'))
+    
+  }
+  ifelse(points.s1 > points.s2, winner <- 1, winner <- 0)
+  
+  return(list(winner, score.sheet))
+}
+@
+
+\subsection{Results}
+I simulated 20000 games to find the mean probability of player 1 winning.
+
+<<Block9, echo = FALSE, warning = FALSE, fig.width= 10, fig.height=5, cache = TRUE>>=
+game1 <- replicate(20000, ping.pong()[[1]])
+
+all.games <- c(game1)
+mean1 <- mean(game1)
+sprintf('Using 20000 games I found a probability of %f of player 1 winning', mean1)
+rolling.mean <- c()
+for (i in 1:length(all.games)) {
+  rolling.mean[i] <- mean(all.games[1:i])
+}
+ggplot() + 
+  geom_smooth(aes(x = c(1:length(rolling.mean)), y = rolling.mean), 
+              se = FALSE, method = 'loess') +
+  xlab('Number of games simulated') + 
+  ylab('Cumulative probability of Player 1 winning') +
+  ggtitle('Plotting the probability of player 1 winning over the course of the simulation') +
+  theme_bw()
+@
+ 
+The distribution of rally length is effectively a modified geometric distribution (modified as the initial parameter is different from subsequent trials) - see histogram.
+
+<<Block10, echo = FALSE, warning = FALSE, fig.width= 10, fig.height=7>>=
+rally.dist <- replicate(100, ping.pong()[2])
+rally.points <- c()
+for (i in 1:length(rally.dist)) {
+  rally.points <- c(rally.points, as.vector(rally.dist[[i]]$rally.len))
+}
+rally.points <- rally.points[which(is.na(rally.points) == F)]
+hist(rally.points, main = 'Histogram of Rally length', 
+     xlab = 'Rally length', ylab = 'Number of Simulated Rallies')
+@
+
+\newpage
+\subsection{Minimal Adjustment of $A_2$}
+To estimate the minimal adjustment of $A_2$ I simulated 1000 games with $A_2$ between 0.6 and 0.65, and then fitted a linear model to find the point where each player wins the same number of games.
+
+<<Block11, echo = FALSE, warning = FALSE, fig.width= 10, fig.height=7, cache = TRUE>>=
+S2.spread <- seq(0.6, 0.65, by = 0.001)
+change.s2 <- replicate(1000, unlist(mcmapply(ping.pong, 
+                                             0.6, S2.spread, n = 11, serve.n = 2, mc.cores = 8)[1,]))
+row.names(change.s2) <- S2.spread
+means <- apply(change.s2, 1, mean)
+dist.to.0.5 <- means - 0.5
+dist.0.5.df <- data.frame(S2.spread, dist.to.0.5)
+lm.S2 <- lm(S2.spread ~ dist.to.0.5)
+cat(sprintf('The probability of player 1 winning was 0.5 when S2 = %f',
+            lm.S2$coefficients[1]))
+ggplot(dist.0.5.df) + geom_point(aes(x = S2.spread, y = dist.to.0.5)) + 
+  stat_smooth(method = 'lm', aes(x = S2.spread, y = dist.to.0.5)) +
+  theme_bw() + ylab('Difference between mean probability and parity') + 
+  xlab('Value set for for A2') +
+  ggtitle('Modelling Minimal Adjustment of A2 using a Linear Model') +
+  geom_abline(intercept = 0, slope = 0, col= 'red')
+@
+
+\newpage
+\subsection{Change A}
+I repeated all of the simulations with each player serving 5 times before changing. I did not repeat the distribution of rally lengths as this was not affected by the change.
+
+<<Block12, echo = FALSE, warning = FALSE , fig.width= 10, fig.height=7, cache = TRUE >>=
+gameA <- replicate(20000, ping.pong(serve.n = 5)[[1]])
+meanA <- mean(gameA)
+cat(sprintf('Using 20000 games, using 5 serves each, 
+            I found a probability of %f of player 1 winning', meanA))
+rolling.meanA <- c()
+for (i in 1:length(gameA)) {
+  rolling.meanA[i] <- mean(gameA[1:i])
+}
+#ggplot() + geom_smooth(aes(x = c(1:length(rolling.meanA)), y = rolling.meanA), se = FALSE) +
+#  xlab('Number of games simulated') + ylab('Cumulative probability of Player 1 winning') +
+#  ggtitle('Plotting the probability of player 1 winning over the course of the simulation', 
+#          subtitle = "Repeated with S = 5")
+@
+
+
+I also repeated the simulation to find the minimal change of $A_2$.
+<<Block12A, echo = FALSE, warning = FALSE, fig.width= 10, fig.height=7, fig.scap= 'Figure showing minimal adjustment of A2 using a linear model, with S = %', cache = TRUE>>=
+S2.spreadA <- seq(0.6, 0.67, by = 0.001)
+change.s2A <- replicate(1000, 
+                        unlist(mcmapply(ping.pong, 0.6, 
+                                              S2.spreadA, n = 11, serve.n = 5, mc.cores = 8)[1,]))
+row.names(change.s2A) <- S2.spreadA
+meansA <- apply(change.s2A, 1, mean)
+dist.to.0.5A <- meansA - 0.5
+dist.0.5.dfA <- data.frame(S2.spreadA, dist.to.0.5A)
+lm.S2A <- lm(S2.spreadA ~ dist.to.0.5A)
+cat(sprintf('The probability of player 1 winning was 0.5 when S2 = %f, using S = 5', 
+            lm.S2A$coefficients[1]))
+ggplot(dist.0.5.dfA) + geom_point(aes(x = S2.spreadA, y = dist.to.0.5A)) + 
+  stat_smooth(method = 'lm', aes(x = S2.spreadA, y = dist.to.0.5A)) +
+  theme_bw() + ylab('Difference between mean probability and parity') + 
+  xlab('Value set for for A2') +
+  ggtitle('Modelling Minimal Adjustment of A2 using a Linear Model', 
+          subtitle = 'Values for S = 5') +
+  geom_abline(intercept = 0, slope = 0, col= 'red')
+@
+
+\newpage
+\subsection{Change B}
+All of the above simulations repeated when the rules changed for a first to 21 game. 
+
+<<Block13, echo = F, warning = FALSE, fig.width= 10, fig.height=7, cache = TRUE>>=
+#Change B
+gameB <- replicate(20000, ping.pong(n = 21)[[1]])
+meanB <- mean(gameB)
+cat(sprintf('For the first to 21 rules, 
+            I found a probability of %f of player 1 winning', meanB))
+rolling.meanB <- c()
+for (i in 1:length(gameB)) {
+  rolling.meanB[i] <- mean(gameB[1:i])
+}
+#ggplot() + geom_smooth(aes(x = c(1:length(rolling.meanB)), y = rolling.meanB), se = FALSE) +
+#  xlab('Number of games simulated') + ylab('Cumulative probability of Player 1 winning') +
+#  ggtitle('Plotting the probability of player 1 winning over the course of the simulation', 
+#          subtitle = "Repeated for first to 21")
+@
+
+
+I also repeated the simulation to find the minimal change of $A_2$.
+<<Block13B, echo = F, warning = FALSE, fig.width= 10, fig.height=7, cache = TRUE>>=
+#Minimal change to S
+S2.spreadB <- seq(0.6, 0.65, by = 0.001)
+change.s2B <- replicate(1000, unlist(mcmapply(ping.pong, 0.6, 
+                                              S2.spreadB, 
+                                              n = 21, serve.n = 2, mc.cores = 8)[1,]))
+row.names(change.s2B) <- S2.spreadB
+meansB <- apply(change.s2B, 1, mean)
+dist.to.0.5B <- meansB - 0.5
+dist.0.5.dfB <- data.frame(S2.spreadB, dist.to.0.5B)
+lm.S2B <- lm(S2.spreadB ~ dist.to.0.5B)
+cat(sprintf('The probability of player 1 winning was 0.5 when S2 = %f, for a first to 21 game', 
+            lm.S2B$coefficients[1]))
+ggplot(dist.0.5.dfB) + geom_point(aes(x = S2.spreadB, y = dist.to.0.5B)) + 
+  stat_smooth(method = 'lm', aes(x = S2.spreadB, y = dist.to.0.5B)) +
+  theme_bw() + ylab('Difference between mean probability and parity') + 
+  xlab('Value set for for A2') +
+  ggtitle('Modelling Minimal Adjustment of A2 using a Linear Model', 
+          subtitle = 'Values for first to 21') +
+  geom_abline(intercept = 0, slope = 0, col= 'red')
+
+@
+ 
+\newpage 
+\subsection{All code used}
+
+<<all-blocks, eval = FALSE>>=
+<<Block1>>
+  
+<<Block2>>
+  
+<<Block3>>
+  
+<<Block4>>
+  
+<<Block5>>
+  
+<<Block6>>
+  
+<<Block7>>
+  
+<<Block8>>
+  
+<<Block9>>
+  
+<<Block10>>
+  
+<<Block11>>
+  
+<<Block12>>
+  
+<<Block12A>>
+  
+<<Block13>>
+  
+<<Block13B>>
+@
+\end{document}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

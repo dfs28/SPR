@@ -1,0 +1,685 @@
+\documentclass{article}
+\usepackage{natbib}
+\usepackage{graphicx}
+\usepackage{graphicx, subfig}
+\usepackage[a4paper, total={6in, 8in}, margin = 1in]{geometry}
+\usepackage{hyperref}
+
+\title{SPA3}
+\author{404018}
+\date{January 2021}
+
+\begin{document}
+
+<<setup, echo = FALSE, eval=TRUE, include=FALSE>>=
+#Set up options
+library(ggplot2)
+library(parallel)
+library(Rcpp)
+library(tidyverse)
+library(gridExtra)
+@
+
+
+
+\maketitle
+
+\section{Introduction}
+This assignment asked for the implementation of 3 solutions to the travelling salesman problem. I chose to use simulated annealing, genetic algorithms and the elastic net solutions. Here I will talk about each of them indvidually and subsequently compare them at the end. For all 3 I tested them using the Berlin test set of 52 locations.
+
+\section{Simulated annealing}
+\subsection{Design choices}
+I used the \href{https://toddwschneider.com/posts/traveling-salesman-with-simulated-annealing-r-and-shiny/}{Todd Schneider website} provided as the basis although did not use their code from GitHub. I used a function that randomly reverses a part of the tour to make the change, as advised in their documentation. I used \href{https://www.hindawi.com/journals/cin/2016/1712630/}{this paper} to choose whether or not a new tour was accepted and reduced the temperature every time a new tour was taken. I built the function that calculates the total distance of the tour in Rcpp to allow it to run more quickly. 
+
+I tested a large range of different approaches to this, however none were very successful. Among approaches I tested - I used an alternative function to change the tour - randomly switching 2 cities in the tour. I implemented an algorithm to change the tour to a less good tour according a probality that falls over time (a simpler approach to the one I settled on). I implemented a logarithmic and exponential decay in temperature. I tested reducing the temperature whether or not the new tour was taken. I also tested different starting temperatures and rate of decay of temperature - see below. Howevever despite this the simulated annealing performed very poorly relative to the optimum solution. 
+
+<<Block1, tidy = TRUE, echo = FALSE, eval = T>>=
+#Read in tsps
+read.in <- function(input, filename) {
+  tsp <- read.delim(input, stringsAsFactors = F)
+  
+  tsp <- tsp[6:dim(input)[1],]
+  tsp.tab <- unlist(sapply(X = tsp1, strsplit, split = ' '))
+  tsp.tab <- tsp.tab[-58]
+  
+  tsp.mat <- matrix(as.numeric(tsp.tab), ncol = 3, byrow = TRUE)
+}
+
+#Read in Berlin TSP
+
+tsp1 <- read.delim('~/Assignment_3/ALL_tsp/berlin52.tsp', stringsAsFactors = F)
+
+tsp1 <- tsp1[6:57,]
+tsp.tab <- unlist(sapply(X = tsp1, strsplit, split = ' '))
+tsp.tab <- tsp.tab[-58]
+
+
+tsp.mat <- matrix(as.numeric(tsp.tab), ncol = 3, byrow = TRUE)
+
+@
+
+\subsection{Functions}
+
+<<Block2, echo = F, eval = T>>=
+#Make temperature function
+temp.log <- function(time, T0 = 0.65, rate = 1) {
+  
+  #Logarithmic reduction of temperature
+  return(T0/ log(1 + time*rate))
+}
+
+temp.exp <- function(time, total.iter, T0 = 0.8, rate = 6) {
+  
+  #Exponential reduction of temperature as a function
+  return(exp(-time/(total.iter/rate))* T0)
+}
+
+temp.sigmoid <- function(time, total.iter, T0 = 0.5,  rate = 100) {
+  return(T0/(1+exp((time-1000)/rate)))
+}
+
+#Rcpp function to calculate total distance
+Rcpp::cppFunction('double total_distC(NumericVector CitX, NumericVector CitY) {
+  
+  //Set intial paramaters - add to end of each vector so that it does full circle
+  int loop_length = CitX.length();
+  CitX.push_back (CitX[0]);
+  CitY.push_back (CitY[0]);
+  double distance = 0;
+  
+  //Loop over the cities in order of the list you give it and add up the distances as you go
+  for (int i = 0; i < loop_length; i++) {
+    double new_dist = sqrt( pow(CitX[i + 1] - CitX[i], 2) + pow(CitY[i + 1] - CitY[i], 2));
+    distance = distance + new_dist;
+  }
+  return(distance);
+}')
+
+change.tour <- function(tour, change.frac = 0.5) {
+  #Function that changes the tour by reversing a asection of the tour
+  
+  length.t <- length(tour)
+  
+  #Set how much to change randomly
+  change.length <- round(runif(1, min = 1, max = change.frac*length.t))
+  
+  #Set where change starts
+  change.loc <- round(runif(1, min = 1, max = length.t))
+  
+  #Double the tour, then reverse a section, put that at the beginning and fill in the rest from there
+  tour.x2 <- c(tour, tour)
+  back.tour <- tour.x2[seq(from = (change.loc + change.length), to = change.loc)]
+  new.tour <- c(back.tour, tour.x2[seq(from = (change.loc + change.length + 1), 
+                                         to = (change.loc + length.t - 1))])
+  return(new.tour)
+}
+
+change.tour2 <- function(tour) {
+  #Swap 2 cities in path
+  length.t <- length(tour)
+  
+  #Choose 2 cities to swap randomly
+  changes <- round(runif(2, min = 1, max = length.t))
+  
+  #Swap them
+  new.tour <- tour
+  new.tour[changes[2:1]] <- tour[changes[1:2]]
+  
+  return(new.tour)
+}
+@
+
+\subsection{Run as integrated function}
+Run the simulated annealing as an integrated function
+
+<<Block3,  tidy = TRUE, eval = T, echo = F, cache = T>>=
+#Put it all together
+simulated.annealing <- function(input.mat, iterations, start.temp = 4000, change.fract = 0.5, rate.temp = 0.99993) {
+  
+  #Set seed to reduce randomness
+  set.seed(1)
+  
+  #Set some initial parameters, make initial objects
+  current.mat <- input.mat
+  progress.df <- data.frame(iteration = 1:iterations, temperature = rep(NA, times = iterations), 
+                            distance = rep(NA, times = iterations))
+  #Get current distance
+  length.tour <- total_distC(current.mat[,2], current.mat[,3])
+  
+  #Set initial temp if not already set
+  current.temp <- start.temp
+  
+  
+  #Monitor the progress
+  #pb <- txtProgressBar(min = 0, max = iterations, style = 3)
+  
+  #Iterate over given length - should this be set by the length of the problem?
+  for (i in 1:iterations) {
+    
+    #Randomly generate new tour and calculate length
+    new.tour <- change.tour(current.mat[,1], change.fract)
+    #new.tour <- change.tour2(current.mat[,1])
+    new.length <- total_distC(current.mat[new.tour,2], current.mat[new.tour,3]) 
+    
+    #Get current temperature
+    #current.temp <- temp.exp(i, iterations, start.temp, rate.temp)
+    
+    rando <- runif(1)
+    
+    #Decide whether to take new tour
+    if(new.length < length.tour || runif(1) < exp(-(new.length - length.tour)/current.temp)) {
+      #If new tour better take it
+      
+      current.mat <- current.mat[new.tour,]
+      progress.df$distance[i] <- new.length
+      length.tour <- new.length
+      current.temp <- current.temp*rate.temp
+    
+    } else {
+      
+      #Keep the old tour
+      progress.df$distance[i] <- length.tour
+      
+    }
+    
+    progress.df$temperature[i] <- current.temp
+    
+    #Monitor progress
+    #setTxtProgressBar(pb, i)
+  }
+  
+  #close(pb)
+  return(list(current.mat, progress.df))
+}
+@
+
+\subsection{Testing parameters}
+Here I tested different starting temperatures and rate of decay of temperature. 
+
+<<Block4, fig = TRUE, echo=F,  fig.width= 10, fig.height=5, warning= FALSE, tidy = TRUE, eval = T, cache = T>>=
+rate.seq <- seq(0.999, 0.99999, 0.00004)
+annealing.rate.3 <- mclapply(rate.seq, simulated.annealing, input.mat = tsp.mat, iterations = 1e6, change.fract = 0.5, start.temp = 1500, mc.cores = 32)
+
+annealing.rate.4 <- mclapply(rate.seq, simulated.annealing, input.mat = tsp.mat, iterations = 1e6, change.fract = 0.5, start.temp = 1000, mc.cores = 32)
+@
+
+<<plots, echo = F, fig = T, fig.height = 5, fig.width=10>>=
+annealing.rate.3.df <- data.frame(rate = rate.seq, distance = NA)
+for (i in 1:length(rate.seq)) {
+  annealing.rate.3.df$distance[i] <- unlist(annealing.rate.3)[52*3+3*1e6]
+}
+a <- ggplot(annealing.rate.3.df) + geom_point(aes(x = rate, y = distance)) + geom_smooth(aes(x = rate, y = distance)) + theme_bw() +
+  xlab('Rate of reduction of temperature') + ylab('total distance') + labs(title = "Plot comparing distance of tour after 1e6 iterations against rate of reduction  of temperature")
+
+annealing.rate.4.df <- data.frame(rate = rate.seq, distance = NA)
+for (i in 1:length(rate.seq)) {
+  annealing.rate.4.df$distance[i] <- unlist(annealing.rate.4)[52*3+3*1e6]
+}
+b <- ggplot(annealing.rate.3.df) + geom_point(aes(x = rate, y = distance)) + geom_smooth(aes(x = rate, y = distance)) + theme_bw() +
+  xlab('Rate of reduction of temperature') + ylab('total distance') + labs(title = "Plot comparing distance of tour after 1e6 iterations against rate of reduction  of temperature")
+grid.arrange(a, b, nrow = 2)
+
+@
+
+\subsection{Results}
+Here you can see that there was not much difference between the different approaches. The overal distance was greater than 2x the optimum distance from TSP lib (the optimum is around 7500).
+
+<<Block5, echo = F, tidy = T, eval = T, fig.height = 5, fig.width=10>>=
+#Test function:
+best.tsp <- simulated.annealing(input.mat = tsp.mat, iterations = 1e3, start.temp = 1500, change.fract = 0.5, rate.temp = 0.99993)
+
+plot1 <- ggplot(best.tsp[2][[1]]) + 
+          geom_line(aes(x = iteration, y = distance), colour = 'green')   + 
+          geom_smooth(aes(x = iteration, y = distance), colour = 'blue') + 
+          theme_bw() 
+plot2 <- ggplot(best.tsp[2][[1]]) + geom_smooth(aes(x = iteration, y = temperature), colour = 'red') + theme_bw()
+
+grid.arrange(plot1, plot2, nrow=2)
+@
+
+\section{Genetic Algorithm}
+The second algorithm I used was the genetic algorithm approach. I used this \href{https://towardsdatascience.com/evolution-of-a-salesman-a-complete-genetic-algorithm-tutorial-for-python-6fe5d2b3ca35}{website} as a basis for my approach, although I didn't use any of the code included in it. I used the partially matched crossover algorithm from the Larranaga paper provided for my algorithm.
+
+<<Genetic_algo, echo = F, fig = T, fig.width= 10, fig.height=3,  eval = T, cache = T>>=
+#New function to make finding distances easier
+all.distances <- function(schedule, input.mat) {
+  total_distC(input.mat[schedule, 2], input.mat[schedule, 3])
+}
+
+#Breed them using crossover algorithm (ordered crossover from Laranaga) 
+crossover <- function(route1, route2, input.routes) {
+  
+  #Set up comparison
+  route1 <- input.routes[, route1]
+  route2 <- input.routes[, route2]
+  
+  #Randomly choose start and finish sites
+  cross.length <- round(runif(1, min = 2, max = length(route1)/2))
+  cross.loc <- round(runif(1, min = 1, max = length(route1)))
+  
+  #Set start and finish points
+  keep.start <- cross.loc + 1
+  keep.end <- cross.length + cross.loc
+  route1x2 <- c(route1, route1)
+  route2x2 <- c(route2, route2)
+  
+  #Make children using algorithm
+  child1 <- route1x2[keep.start:keep.end]
+  child1 <- c(child1, route2[-which(route2 %in% child1)])
+  
+  child2 <- route2x2[keep.start:keep.end]
+  child2 <- c(child2, route1[-which(route1 %in% child2)])
+  
+  return(data.frame(child1, child2))
+}
+
+#Wrap everying in a function - could consider having more parameters like number of elites that you keep, size of population
+genetic.algorithm <- function(input.mat, initial.pop, iterations, elites.num) {
+  
+  schedule <- input.mat[,1]
+  
+  #Generate random population of routes
+  random.routes.df <- replicate(initial.pop, sample(schedule, length(schedule)))
+  
+  #Keep track of progress
+  progress.df <- data.frame(iteration = 1:iterations, distance = rep(NA, times = iterations))
+  #pb <- txtProgressBar(min = 0, max = iterations, style = 3)
+  
+  #Set number parents to breed to keep
+  exp.children <- (initial.pop-elites.num)/2
+  parents <- 1
+  only.children <- 0
+  
+  #Work out minimum number of parents needed
+  while (only.children < exp.children) {
+    parents <- parents + 1
+    only.children <- length(rep(1:parents, times = parents:1))
+  }
+  
+  #Set maximum size for new data frame
+  new.size <- ifelse(initial.pop > only.children*2, initial.pop, only.children*2)
+  
+  for (i in 1:iterations) {
+    
+    #Get route distances
+    route.dist <- data.frame(route = 1:initial.pop, distance = NA, fitness = NA)
+    route.dist$distance <- apply(random.routes.df, 2, all.distances, input.mat)
+    
+    #Consider fitness parameter
+    ranking <- sort(route.dist$distance)
+    route.dist$ranking <- NA
+    
+    #Makes ranking of best routes
+    k <- 1
+    while (k <= length(ranking)) {
+      matches <- which(route.dist$distance == ranking[k])
+      if (length(matches) > 1) {
+        for (j in 1:length(matches)) {
+          route.dist$ranking[matches[j]] <- k + j - 1
+        }
+        k <- k + length(matches)
+        } else {
+        route.dist$ranking[matches] <- k
+        k <- k + 1
+      }
+    }
+    
+    route.dist$fitness <- 1/route.dist$distance
+    
+    #Mark best distance at this stage
+    progress.df$distance[i] <- route.dist$distance[which(route.dist$ranking == 1)]
+    
+    #Choose which to breed - generate proportional probability of choice given fitness
+    route.dist$probability <- route.dist$fitness/ sum(route.dist$fitness)
+    
+    #Take the best 10 to keep for later
+    elites <- which(route.dist$ranking %in% 1:elites.num)
+    
+    #Choose a number of these based on the above probabilty to make breeding pool
+    breeding.pool <- sample(1:initial.pop, parents + 1, prob = route.dist$probability)
+    
+    #Apply crossover to all possible pairs
+    all.comb.df <- data.frame(parent1 = unlist(sapply(c(1:parents), seq, to = parents)), 
+                              parent2 = rep(1:parents, times = parents:1))
+    
+    new.routes <- matrix(nrow = length(schedule), 
+                         ncol = new.size)
+    
+    
+    #Loop to apply it on all poss pairs
+    for (j in 1:length(all.comb.df$parent1)) {
+      children <- crossover(all.comb.df[j,1], all.comb.df[j,2], random.routes.df)
+      new.routes[,(2*j-1)] <- children$child1
+      new.routes[,(2*j)] <- children$child2
+    }
+    
+    #Remove any that are longer than the frame
+    if (new.size > initial.pop) {
+      new.routes <- new.routes[,-c((initial.pop+1):new.size)]
+    }
+    
+    #Keep the elites
+    new.routes[,seq(initial.pop - elites.num + 1, initial.pop)] <- random.routes.df[,elites]
+    
+    #Randomly change one route but not the best route
+    
+    random <- round(runif(1, 1, initial.pop))
+    if (random != which(route.dist$ranking == 1)) {
+      random.loc <- round(runif(1,1,length(schedule)))
+      random.switch <- round(runif(1,1,length(schedule)))
+      swap1 <- new.routes[random.loc,random]
+      swap2 <- new.routes[random.switch, random]
+      new.routes[random.loc,random] <- swap2
+      new.routes[random.switch, random] <- swap1
+    }
+   
+    #Set the block of routes to the new block and start next iteration
+    random.routes.df <- new.routes
+    
+    #setTxtProgressBar(pb, i)
+  }
+  
+  #Calculate best route now
+  route.dist <- data.frame(route = 1:initial.pop, distance = NA, fitness = NA)
+  route.dist$distance <- apply(random.routes.df, 2, all.distances, input.mat)
+  
+  #Consider fitness parameter
+  ranking <- match(route.dist$distance, sort(route.dist$distance))
+  best.route <- random.routes.df[,ranking[1]]
+  
+  return(c(best.route, progress.df))
+}
+@
+
+
+\subsection{Testing the genetic algorithm}
+Next I tested the genetic algorithm with a number of parameters including the number of elites I kept and the population I was breeding from. Here you can see that ... performed the best. 
+
+<<Auto-encoder, tidy = TRUE, echo = F, cache = T, eval =T, fig.height = 5, fig.width=10>>=
+pop.seq <- round(seq(60, 140, length.out = 30))
+genetic.change.pop <- mclapply(pop.seq, genetic.algorithm, input.mat = tsp.mat, elites.num = 5, iterations = 5e5, mc.cores = 32)
+genetic.pop.df <- data.frame(pop = pop.seq, distance = NA)
+for (i in 1:length(pop.seq)) {
+  genetic.pop.df$distance[i] <- genetic.change.pop[[i]]$distance[1e2]
+}
+ggplot(genetic.pop.df) + geom_point(aes(x = pop, y = distance)) + geom_smooth(aes(x = pop, y = distance)) + theme_bw() +
+  xlab('Population size') + ylab('Distance') + labs(title = 'Distance  after 1')
+
+
+@
+
+\subsection{Results}
+I then tested the algorithm on the Berlin dataset. Here you can see that it performs around the same as the simulated annealing algorithm. 
+
+<<Genetic_test, echo= F, tidy = T, cache = T, fig.height = 5, fig.width=10>>=
+genetic.test <- genetic.algorithm(tsp.mat, 100, 5e5, 10)
+plot.new()
+ggplot() + geom_line(aes(x = genetic.test$iteration, y = genetic.test$distance)) + theme_bw() +
+  xlab('Iteration') + ylab('Best tour distance') + title(main = "Plot of best tour distance against time \n for Genetic Algorithm using best settings")
+@
+
+\section{Elastic net}
+The last algorithm I used was the elastic net. I used the equations from the Durbin paper. I built the core functions of this in Rcpp. For this algorithm I normalised all of the coordinates to be between 0 and 1 to allow the algorithm to run correctly. I reduced k by 0.99 every iteration and used 2.5 times as many points as cities. 
+
+<<Elastic_net, tide = TRUE, echo = F, cache = T, eval = T, fig.height= 5, fig.width= 10>>=
+tsp.mat -> input.mat
+
+#Rcpp function to calculate total distance
+Rcpp::cppFunction('double total_distC(NumericVector CitX, NumericVector CitY) {
+  
+  //Set intial paramaters - add to end of each vector so that it does full circle
+  int loop_length = CitX.length();
+  CitX.push_back (CitX[0]);
+  CitY.push_back (CitY[0]);
+  double distance = 0;
+  
+  //Loop over the cities in order of the list you give it and add up the distances as you go
+  for (int i = 0; i < loop_length; i++) {
+    double new_dist = sqrt( pow(CitX[i + 1] - CitX[i], 2) + pow(CitY[i + 1] - CitY[i], 2));
+    distance = distance + new_dist;
+  }
+  return(distance);
+}')
+
+#New function to make finding distances easier
+all.distances <- function(schedule, input.mat) {
+  total_distC(input.mat[schedule, 2], input.mat[schedule, 3])
+}
+
+#Function to calculate weights
+Rcpp::cppFunction("NumericMatrix weights_calc_C(NumericVector citiesX, NumericVector citiesY, 
+                             NumericVector pointsX, NumericVector pointsY, 
+                             long double exp, double k) {
+  
+  //make final matrix
+  //NumericMatrix weights(citiesX.size(), pointsX.size());
+  NumericMatrix weights(citiesX.size(), pointsX.size());
+  double k_const = 2*k*k;
+  
+  for (int j = 0; j < pointsX.size(); j++) {
+    //Work through rows second
+    
+    for  (int i = 0; i < citiesX.size(); i++) {
+      //Work through columns first
+      weights(i, j) = pow(exp, -(pow(citiesX[i] - pointsX[j], 2) + pow(citiesY[i] - pointsY[j], 2))/k_const);
+      
+    }
+  }
+  
+  return(weights);
+}"
+)
+
+#Wrapper function
+weights_calc <- function(inputs, input.points, k) {
+  
+  #Put inputs into correct form
+  weights <- t(weights_calc_C(inputs[,2], inputs[,3], input.points[,1], input.points[,2], exp(1), k))
+  
+  #Normalise by the column sum
+  colsums <- apply(weights, 2, sum)
+  nonzero <- which(colsums != 0)
+  
+  #Ensure not getting dim error
+  if(length(nonzero) > 1) {
+    nonzero.weights <- apply(weights[,nonzero], 2, function(x) (x/sum(x)))
+    weights[,nonzero] <- nonzero.weights
+  } else if (length(nonzero) == 1) {
+    nonzero.weights <- weights[,nonzero]/sum(weights[,nonzero])
+    weights[,nonzero] <- nonzero.weights
+  } 
+  
+  return(weights)
+}
+
+#Function to calculate deltas
+Rcpp::cppFunction('
+                  NumericMatrix delta_yC(NumericMatrix weights, NumericVector citiesX, 
+                  NumericVector citiesY, NumericVector pointsX, NumericVector pointsY, 
+                  double alpha, double beta, double k) {
+  
+  //make final matrix
+  NumericMatrix delta_ys(pointsX.size()/3, 2);
+  int point_size = pointsX.size()/3;
+  
+  for (int j = 0; j < pointsX.size()/3; j++) {
+    //Work through rows second
+    
+    //Initiate the point sums as zero
+    long double delta_yx = 0;
+    long double delta_yy = 0;
+    
+    for  (int i = 0; i < citiesX.size(); i++) {
+      
+      //Work through columns first - this will  get the  point-sums and add them up as we go
+      delta_yx = delta_yx + alpha*weights(i, j)*(citiesX(i) - pointsX(j));
+      delta_yy = delta_yy + alpha*weights(i, j)*(citiesY(i) - pointsY(j));
+    }
+    
+    //Add the point sums to the neighbour effect
+    delta_ys(j, 0) = delta_yx + beta*k*(pointsX(j + 1 + point_size) - 
+    2*pointsX(j + point_size) + pointsX(j - 1 + point_size));
+    delta_ys(j, 1) = delta_yy + beta*k*(pointsY(j + 1 + point_size) - 
+    2*pointsY(j + point_size) + pointsY(j - 1 + point_size));
+    
+
+  }
+  
+  return(delta_ys);
+}'
+)
+
+#Wrapper function
+delta_y <- function(weight.input, input, point.input, alpha.input, beta.input, k.input) {
+  delta_yC(t(weight.input), input[,2], input[,3], rep(point.input[,1], 3), 
+           rep(point.input[,2], 3), alpha.input, beta.input, k.input)
+}
+
+#Function
+elastic_net <- function(input.mat, alpha, beta, k, iterations) {
+  
+  #Normalise input locations
+  input.mat[,2] <- input.mat[,2]/max(input.mat[,2])
+  input.mat[,3] <- input.mat[,3]/max(input.mat[,3])
+  
+  #Set up initial distribution of points
+  xcentre <- mean(input.mat[,2])
+  ycentre <- mean(input.mat[,3])
+  
+  radius <- (sd(input.mat[,2]) + sd(input.mat[,3]))/10
+  
+  npoints <- length(input.mat[,1])*2.5
+  
+  points <- data.frame(x = cos(2*(1:npoints)*pi/npoints)*radius + xcentre,
+                       y = sin(2*(1:npoints)*pi/npoints)*radius + ycentre)
+  
+  #Delta function - this is probably where could use Rcpp
+  for (i in 1:iterations) {
+    
+    k <- k*0.99
+    #k <- temp.exp(i, iterations)*
+    
+    #Make weight matrix
+    weight.mat <- weights_calc(input.mat, points, k)
+    
+    #Get deltas
+    deltas <- delta_y(weight.mat, input.mat, points, alpha, beta, k)
+    
+    #Update points
+    points <- points + deltas
+    
+  }
+
+   #Order the points
+  best.order <- rep(NA, times = dim(input.mat)[1])
+  
+  #Match each city to a point
+  for (j in 1:dim(input.mat)[1]) {
+      best.order[j] <- which(round(points[,1], 12) == round(input.mat[j,2], 12) & 
+                               round(points[,2],12) == round(input.mat[j,3],12))[1]
+  }
+  
+  #Order the matrix by the matches above
+  orderd.mat <- cbind(input.mat, best.order)
+  orderd.mat <- orderd.mat[order(orderd.mat[,4]),]
+  
+  #Calculate the distance
+  distance <- all.distances(orderd.mat[,1], tsp.mat)
+  return(list(points, input.mat, distance))
+}
+@
+
+\subsection{Testing and results}
+I tested a variety of different values of k, beta and alpha - see graphs below. I found that alpha of 0.2, k of 0.2 and beta of 2 performed well. K is the speed at which the points move outwards initially, alpha is the attraction to cities and beta the attraction to other points for each point. 
+
+<<test_net, echo = F, tidy = T, fig.height= 5, fig.width=10>>=
+k.seq <- seq(0.01, 0.5, by = 0.02)
+elastic.net.test <- mclapply(k.seq, elastic_net, input.mat = tsp.mat, alpha = 0.2, beta = 2, iterations = 7500, mc.cores = 32)
+
+elastic.k.df <- data.frame(k = k.seq, distance = NA)
+for (i in 1:length(k.seq)) {
+  elastic.k.df$distance[i] <- elastic.net.test[[i]][[3]]
+}
+ggplot(elastic.k.df) + geom_point(aes(x = k, y = distance)) + geom_smooth(aes(x = k, y = distance)) + theme_bw() +
+  xlab('k') + ylab('Distance') + labs(title = 'Plotting change in k against final distance for this dataset')
+
+
+beta.seq <- seq(1, 3, by = 0.2)
+elastic.net.test2 <- mclapply(beta.seq, elastic_net, input.mat = tsp.mat, alpha = 0.2, k = 0.2, iterations = 7500, mc.cores = 32)
+
+elastic.beta.df <- data.frame(k = k.seq, distance = NA)
+for (i in 1:length(k.seq)) {
+  elastic.beta.df$distance[i] <- elastic.net.test2[[i]][[3]]
+}
+ggplot(elastic.beta.df) + geom_point(aes(x = k, y = distance)) + geom_smooth(aes(x = k, y = distance)) + theme_bw() +
+  xlab('Beta') + ylab('Distance') + labs(title = 'Plotting change in beta against final distance for this dataset')
+
+elastic.net.test3 <- mclapply(k.seq, elastic_net, input.mat = tsp.mat, beta = 2, k = 0.2, iterations = 7500, mc.cores = 32)
+
+elastic.alpha.df <- data.frame(k = k.seq, distance = NA)
+for (i in 1:length(k.seq)) {
+  elastic.alpha.df$distance[i] <- elastic.net.test3[[i]][[3]]
+}
+ggplot(elastic.beta.df) + geom_point(aes(x = k, y = distance)) + geom_smooth(aes(x = k, y = distance)) + theme_bw() +
+  xlab('Alpha') + ylab('Distance') + labs(title = 'Plotting change in beta against final distance for this dataset')
+
+
+elastic.net.solve <- elastic_net(input.mat, alpha = 0.2, beta = 2, k = 0.2, iterations = 7500)
+points <- elastic.net.solve[[1]]
+input.mat <- elastic.net.solve[[2]]
+distance <- elastic.net.solve[[3]]
+
+ggplot() + geom_point(aes(x = points$x, y = points$y, col = 'red')) +
+      geom_point(aes(x = input.mat[,2], y = input.mat[,3])) + 
+      theme_bw() + geom_path(aes(x = points$x, y = points$y, col = 'red'))
+@
+\subsection{Testing elastic net on a larger dataset}
+The elastic net ran very fast and performed well - as above. I therefore tested this on a larger dataset.
+
+<<Big_data, echo = F, eval = T, cache = T>>=
+tsp.big <- read.delim('~/Assignment_3/ALL_tsp/a280.tsp', stringsAsFactors = F)
+
+tsp.big <- tsp.big[6:285,]
+tsp.big.tab <- unlist(sapply(X = tsp.big, strsplit, split = ' '))
+tsp.big.tab <- tsp.big.tab[which(tsp.big.tab != "")]
+
+
+tsp.big.mat <- matrix(as.numeric(tsp.big.tab), ncol = 3, byrow = TRUE)
+
+system.time(elastic_net(tsp.big.mat, alpha = 0.2, k = 0.2, beta = 2, iterations = 7500))
+@
+
+\section{Comparison}
+I found that the simulated annealing was the easiest to understand and to implement, however despite significant attempts at optimisation and multiple alterations in strategy it performed very poorly. As it was simple to implement I was able to implement some of the core aspects of this in C++ which means that it runs reasonably fast, but takes a long time to find a reasonable solution. 
+
+I found that the genetic algorithms were relatively easy to understand but more complex to implement, and it wasn't entirely clear to me how they work in practice from the paper. This is why I used a website as the basis of my implementation. 
+
+I found that the elastic net was simple in principle but involved quite complex algorithms. This mean implementing the two simultaneous differential equations specified in the Durbin paper. However once I understood the equations they were simple enough to implement - to the extent that the majority of my implementation was in C++. As a result of this it runs very fast. It was very sensitive to the starting parameters but once I had optimised these it also provided good solutions - around 1.1 to 1.2 times the optimum solution.
+
+\newpage 
+\section{All code used}
+
+<<all-blocks, eval = FALSE, tidy=TRUE>>=
+<<setup>>
+
+<<Block1>>
+  
+<<Block2>>
+  
+<<Block3>>
+  
+<<Block4>>
+  
+<<Block5>>
+  
+<<Genetic_algo>>
+  
+<<Auto-encoder>>
+  
+<<Genetic_test>>
+  
+<<Elastic_net>>
+  
+<<test_net>>
+@
+\end{document}
